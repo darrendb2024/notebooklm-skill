@@ -37,7 +37,40 @@ FOLLOW_UP_REMINDER = (
 )
 
 
-def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> str:
+def clear_chat_history(page) -> bool:
+    """Clear NotebookLM chat history via Chat options menu."""
+    try:
+        options_btn = page.query_selector('[aria-label="Chat options"]')
+        if not options_btn:
+            return False
+        options_btn.click()
+        time.sleep(1)
+        # Find "Delete chat history" menu item
+        menu_items = page.query_selector_all('[role="menuitem"], .mat-menu-item, [class*="menu-item"]')
+        for item in menu_items:
+            try:
+                txt = item.inner_text().strip()
+                if "Delete chat history" in txt or "delete" in txt.lower():
+                    item.click()
+                    time.sleep(1)
+                    # Confirm if dialog appears
+                    confirm = page.query_selector('button:has-text("Delete"), button:has-text("Confirm"), button:has-text("OK")')
+                    if confirm:
+                        confirm.click()
+                        time.sleep(1)
+                    print("  🗑️ Chat history cleared")
+                    return True
+            except:
+                continue
+        # Close menu if delete not found
+        page.keyboard.press("Escape")
+        return False
+    except Exception as e:
+        print(f"  ⚠️ Could not clear chat history: {e}")
+        return False
+
+
+def ask_notebooklm(question: str, notebook_url: str, headless: bool = False, new_chat: bool = True) -> str:
     """
     Ask a question to NotebookLM
 
@@ -45,6 +78,7 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
         question: Question to ask
         notebook_url: NotebookLM notebook URL
         headless: Run browser in headless mode
+        new_chat: Clear chat history before asking (avoids context contamination)
 
     Returns:
         Answer text from NotebookLM
@@ -76,10 +110,16 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
         print("  🌐 Opening notebook...")
         page.goto(notebook_url, wait_until="domcontentloaded")
 
-        # Wait for NotebookLM
-        page.wait_for_url(re.compile(r"^https://notebooklm\.google\.com/"), timeout=10000)
+        # Verify we're on NotebookLM (check URL directly, no navigation event needed)
+        current_url = page.url
+        if "notebooklm.google.com" not in current_url:
+            # Redirected to login or elsewhere
+            raise Exception(f"Unexpected URL after navigation: {current_url}")
 
-        # Wait for query input (MCP approach)
+        # Wait for SPA to finish mounting components
+        time.sleep(3)
+
+        # Wait for query input — give page time to fully render chat interface
         print("  ⏳ Waiting for query input...")
         query_element = None
 
@@ -87,8 +127,8 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
             try:
                 query_element = page.wait_for_selector(
                     selector,
-                    timeout=10000,
-                    state="visible"  # Only check visibility, not disabled!
+                    timeout=30000,
+                    state="visible"
                 )
                 if query_element:
                     print(f"  ✓ Found input: {selector}")
@@ -97,12 +137,60 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
                 continue
 
         if not query_element:
+            # Dump available inputs for debugging — also check shadow DOM
+            try:
+                inputs = page.evaluate("""() => {
+                    function queryAll(root, sel) {
+                        let found = [...root.querySelectorAll(sel)];
+                        root.querySelectorAll('*').forEach(el => {
+                            if (el.shadowRoot) found = found.concat(queryAll(el.shadowRoot, sel));
+                        });
+                        return found;
+                    }
+                    const sel = 'textarea, [contenteditable="true"], [role="textbox"], input[type="text"]';
+                    const els = queryAll(document, sel);
+                    return els.map(e => ({
+                        tag: e.tagName,
+                        class: e.className ? String(e.className).substring(0, 60) : '',
+                        aria: e.getAttribute('aria-label') || '',
+                        placeholder: e.getAttribute('placeholder') || '',
+                        role: e.getAttribute('role') || '',
+                        visible: e.offsetParent !== null,
+                        inShadow: e.getRootNode() !== document
+                    }));
+                }""")
+                print(f"  🔍 Found {len(inputs)} input elements (including shadow DOM):")
+                for el in inputs:
+                    shadow = " [SHADOW]" if el.get('inShadow') else ""
+                    print(f"     {el['tag']}{shadow} class='{el['class']}' aria='{el['aria']}' placeholder='{el['placeholder']}' visible={el['visible']}")
+                # Also dump page title and URL for context
+                print(f"  🔍 Page URL: {page.url}")
+                print(f"  🔍 Page title: {page.title()}")
+            except Exception as de:
+                print(f"  🔍 Debug failed: {de}")
             print("  ❌ Could not find query input")
             return None
 
+        # Clear chat history for fresh context (avoids contamination from previous sessions)
+        if new_chat:
+            clear_chat_history(page)
+            time.sleep(1)
+
+        # Snapshot existing responses BEFORE typing (fix: prevent returning stale cached response)
+        previous_response = None
+        for selector in RESPONSE_SELECTORS:
+            try:
+                elements = page.query_selector_all(selector)
+                if elements:
+                    previous_response = elements[-1].inner_text().strip()
+                    print(f"  📸 Snapshot: found existing response ({len(previous_response)} chars)")
+                    break
+            except:
+                continue
+
         # Type question (human-like, fast)
         print("  ⏳ Typing question...")
-        
+
         # Use primary selector for typing
         input_selector = QUERY_INPUT_SELECTORS[0]
         StealthUtils.human_type(page, input_selector, question)
@@ -120,13 +208,17 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
         answer = None
         stable_count = 0
         last_text = None
-        deadline = time.time() + 120  # 2 minutes timeout
+        saw_activity = False              # thinking indicator OR new streaming text seen
+        start = time.time()
+        no_activity_grace = 60            # fail fast if nothing happens at all
+        deadline = start + 240            # overall cap for genuinely long responses
 
         while time.time() < deadline:
             # Check if NotebookLM is still thinking (most reliable indicator)
             try:
                 thinking_element = page.query_selector('div.thinking-message')
                 if thinking_element and thinking_element.is_visible():
+                    saw_activity = True
                     time.sleep(1)
                     continue
             except:
@@ -141,7 +233,9 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
                         latest = elements[-1]
                         text = latest.inner_text().strip()
 
-                        if text:
+                        # Must be different from pre-question snapshot
+                        if text and text != previous_response:
+                            saw_activity = True
                             if text == last_text:
                                 stable_count += 1
                                 if stable_count >= 3:  # Stable for 3 polls
@@ -155,6 +249,12 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
 
             if answer:
                 break
+
+            # Fail fast: no thinking indicator and no new text within grace window
+            # (submit didn't register, or stale chat UI) — avoids a full 4-minute hang.
+            if not saw_activity and (time.time() - start) > no_activity_grace:
+                print(f"  ❌ No response activity after {no_activity_grace}s — submit likely didn't register (try --new-chat / re-auth)")
+                return None
 
             time.sleep(1)
 
@@ -194,6 +294,8 @@ def main():
     parser.add_argument('--notebook-url', help='NotebookLM notebook URL')
     parser.add_argument('--notebook-id', help='Notebook ID from library')
     parser.add_argument('--show-browser', action='store_true', help='Show browser')
+    parser.add_argument('--new-chat', action='store_true', help='(deprecated) clearing chat history is now the default')
+    parser.add_argument('--keep-history', action='store_true', help='Do NOT clear chat history (keep prior chat context)')
 
     args = parser.parse_args()
 
@@ -235,7 +337,8 @@ def main():
     answer = ask_notebooklm(
         question=args.question,
         notebook_url=notebook_url,
-        headless=not args.show_browser
+        headless=not args.show_browser,
+        new_chat=not args.keep_history
     )
 
     if answer:
